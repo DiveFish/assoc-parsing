@@ -1,23 +1,21 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
 
 use failure::Error;
-use finalfusion::{
-    embeddings::Embeddings as FFEmbeddings,
-    io::{MmapEmbeddings, ReadEmbeddings},
-    storage::StorageWrap,
-    vocab::VocabWrap,
-};
 use ordered_float::NotNan;
 use protobuf::core::Message;
+use tf_embed;
+use tf_embed::ReadWord2Vec;
 use tf_proto::ConfigProto;
 
 use dpar::features;
-use dpar::features::{AddressedValues, Embeddings, Layer, LayerLookups};
+use dpar::features::{AddressedValues, Layer, LayerLookups};
 use dpar::models::lr::PlateauLearningRate;
 use dpar::models::tensorflow::{LayerOp, LayerOps};
 
+use util::associations_from_buf_read;
 use StoredLookupTable;
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -39,11 +37,13 @@ impl Config {
         self.model.parameters = relativize_path(config_path, &self.model.parameters)?;
         self.parser.inputs = relativize_path(config_path, &self.parser.inputs)?;
         self.parser.transitions = relativize_path(config_path, &self.parser.transitions)?;
+        self.parser.associations = relativize_path(config_path, &self.parser.associations)?;
 
         relativize_embed_path(config_path, &mut self.lookups.word)?;
         relativize_embed_path(config_path, &mut self.lookups.tag)?;
         relativize_embed_path(config_path, &mut self.lookups.deprel)?;
         relativize_embed_path(config_path, &mut self.lookups.feature)?;
+        relativize_embed_path(config_path, &mut self.lookups.chars)?;
 
         Ok(())
     }
@@ -55,6 +55,8 @@ pub struct Parser {
     pub system: String,
     pub inputs: String,
     pub transitions: String,
+    pub associations: String,
+    pub no_lowercase_tags: Vec<String>,
     pub train_batch_size: usize,
     pub parse_batch_size: usize,
 }
@@ -64,6 +66,11 @@ impl Parser {
         let f = File::open(&self.inputs)?;
         Ok(AddressedValues::from_buf_read(BufReader::new(f))?)
     }
+
+    pub fn load_associations(&self) -> Result<HashMap<(String, String, String), f32>, Error> {
+        let f = File::open(&self.associations)?;
+        Ok(associations_from_buf_read(f)?)
+    }
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -71,6 +78,7 @@ pub struct Lookups {
     pub word: Option<Lookup>,
     pub tag: Option<Lookup>,
     pub deprel: Option<Lookup>,
+    pub chars: Option<Lookup>,
     pub feature: Option<Lookup>,
 }
 
@@ -97,6 +105,10 @@ impl Lookups {
             lookups.insert(Layer::Feature, load_fun(lookup)?);
         }
 
+        if let Some(ref lookup) = self.chars {
+            lookups.insert(Layer::Char, load_fun(lookup)?);
+        }
+
         Ok(lookups)
     }
 
@@ -106,9 +118,11 @@ impl Lookups {
 
     fn create_layer_tables(&self, lookup: &Lookup) -> Result<Box<features::Lookup>, Error> {
         match lookup {
-            &Lookup::Embedding { ref filename, .. } => {
-                Ok(Box::new(Self::load_embeddings(filename)?))
-            }
+            &Lookup::Embedding {
+                ref filename,
+                normalize,
+                ..
+            } => Ok(Box::new(Self::load_embeddings(filename, normalize)?)),
             &Lookup::Table { ref filename, .. } => {
                 Ok(Box::new(StoredLookupTable::create(filename)?))
             }
@@ -122,40 +136,63 @@ impl Lookups {
     pub fn layer_ops(&self) -> LayerOps<String> {
         let mut names = LayerOps::new();
 
-        self.insert_layer_op(&mut names, Layer::Token, &self.word);
-        self.insert_layer_op(&mut names, Layer::Tag, &self.tag);
-        self.insert_layer_op(&mut names, Layer::DepRel, &self.deprel);
-        self.insert_layer_op(&mut names, Layer::Feature, &self.feature);
+        if let Some(ref lookup) = self.word {
+            names.insert(Layer::Token, self.layer_op(lookup));
+        }
+
+        if let Some(ref lookup) = self.tag {
+            names.insert(Layer::Tag, self.layer_op(lookup));
+        }
+
+        if let Some(ref lookup) = self.deprel {
+            names.insert(Layer::DepRel, self.layer_op(lookup));
+        }
+
+        if let Some(ref lookup) = self.feature {
+            names.insert(Layer::Feature, self.layer_op(lookup));
+        }
+
+        if let Some(ref lookup) = self.chars {
+            names.insert(Layer::Char, self.layer_op(lookup));
+        }
 
         names
     }
 
-    fn insert_layer_op(&self, names: &mut LayerOps<String>, layer: Layer, lookup: &Option<Lookup>) {
-        let lookup = match lookup {
-            Some(ref lookup) => lookup,
-            None => return,
-        };
-
-        if let Lookup::Table { ref op, .. } = lookup {
-            names.insert(layer, LayerOp(op.clone()));
+    fn layer_op(&self, lookup: &Lookup) -> LayerOp<String> {
+        match lookup {
+            &Lookup::Embedding {
+                ref op,
+                ref embed_op,
+                ..
+            } => LayerOp::Embedding {
+                op: op.clone(),
+                embed_op: embed_op.clone(),
+            },
+            &Lookup::Table { ref op, .. } => LayerOp::Table { op: op.clone() },
         }
     }
 
     fn load_layer_tables(&self, lookup: &Lookup) -> Result<Box<features::Lookup>, Error> {
         match lookup {
-            &Lookup::Embedding { ref filename, .. } => {
-                Ok(Box::new(Self::load_embeddings(filename)?))
-            }
+            &Lookup::Embedding {
+                ref filename,
+                normalize,
+                ..
+            } => Ok(Box::new(Self::load_embeddings(filename, normalize)?)),
             &Lookup::Table { ref filename, .. } => Ok(Box::new(StoredLookupTable::open(filename)?)),
         }
     }
 
-    fn load_embeddings(filename: &str) -> Result<Embeddings, Error> {
+    fn load_embeddings(filename: &str, normalize: bool) -> Result<tf_embed::Embeddings, Error> {
         let f = File::open(filename)?;
-        let embeds: FFEmbeddings<VocabWrap, StorageWrap> =
-            ReadEmbeddings::read_embeddings(&mut BufReader::new(f))?;
+        let mut embeds = tf_embed::Embeddings::read_word2vec_binary(&mut BufReader::new(f))?;
 
-        Ok(embeds.into())
+        if normalize {
+            embeds.normalize()
+        }
+
+        Ok(embeds)
     }
 }
 
@@ -164,6 +201,7 @@ impl Lookups {
 pub enum Lookup {
     Embedding {
         filename: String,
+        normalize: bool,
         op: String,
         embed_op: String,
     },
@@ -210,14 +248,12 @@ fn relativize_path(config_path: &Path, filename: &str) -> Result<String, Error> 
         .ok_or(format_err!(
             "Cannot get the parent path for the configuration file {}",
             config_path.display()
-        ))?
-        .join(path)
+        ))?.join(path)
         .to_str()
         .ok_or(format_err!(
             "Cannot convert parent path of configuration file to string: {}",
             config_path.display()
-        ))?
-        .to_owned())
+        ))?.to_owned())
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -235,7 +271,6 @@ pub struct Model {
     /// Thread pool size for parallel processing of independent computation
     /// graph ops.
     pub inter_op_parallelism_threads: usize,
-
 }
 
 impl Model {

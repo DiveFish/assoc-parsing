@@ -9,40 +9,45 @@ lazy_static! {
             system: String::from("stackproj"),
             inputs: String::from("parser.inputs"),
             transitions: String::from("parser.transitions"),
-            train_batch_size: 8192,
-            parse_batch_size: 8192,
+            associations: String::from("parser.associations"),
+            no_lowercase_tags: vec!["TAG".to_string()],
+            train_batch_size: 8000,
+            parse_batch_size: 4000,
         },
         model: Model {
-            graph: String::from("parser.graph"),
+            graph: String::from("model.bin"),
             parameters: String::from("params"),
-            intra_op_parallelism_threads: 2,
-            inter_op_parallelism_threads: 2,
-        },
-        train: Train {
-            initial_lr: 0.05.into(),
-            lr_scale: 0.5.into(),
-            lr_patience: 4,
-            patience: 10,
+            intra_op_parallelism_threads: 4,
+            inter_op_parallelism_threads: 6,
         },
         lookups: Lookups {
             word: Some(Lookup::Embedding {
                 filename: String::from("word-vectors.bin"),
-                op: String::from("model/tokens"),
-                embed_op: String::from("model/token_embeds"),
+                normalize: true,
+                op: String::from("word_op"),
+                embed_op: String::from("word_embed_op"),
             }),
             tag: Some(Lookup::Embedding {
                 filename: String::from("tag-vectors.bin"),
-                op: String::from("model/tags"),
-                embed_op: String::from("model/tag_embeds"),
+                normalize: true,
+                op: String::from("tag_op"),
+                embed_op: String::from("tag_embed_op"),
             }),
-            deprel: Some(Lookup::Table {
-                filename: String::from("deprels.lookup"),
-                op: String::from("model/deprels"),
+            deprel: Some(Lookup::Embedding {
+                filename: String::from("deprel-vectors.bin.real"),
+                normalize: false,
+                op: String::from("deprel_op"),
+                embed_op: String::from("deprel_embed_op"),
             }),
-            feature: Some(Lookup::Table {
-                filename: String::from("features.lookup"),
-                op: String::from("model/features"),
-            }),
+
+            chars: None,
+            feature: None
+        },
+        train: Train {
+            initial_lr: 0.05.into(),
+            lr_scale: 0.5.into(),
+            lr_patience: 5,
+            patience: 10,
         }
     };
 }

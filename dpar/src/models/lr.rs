@@ -135,6 +135,8 @@ impl LearningRateSchedule for PlateauLearningRate {
 
 #[cfg(test)]
 mod tests {
+    use approx::*;
+
     use super::{
         ConstantLearningRate, ExponentialDecay, LearningRateSchedule, PlateauLearningRate,
     };
