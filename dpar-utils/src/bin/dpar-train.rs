@@ -199,8 +199,7 @@ where
         );
         model
             .save(format!(
-                "/home/patricia/dpar-depembeds/dpar-utils/testdata/models/UD/tueba-dz/model/params/epoch-{}",
-                //"/Users/patricia/RustProjects/dpar/dpar-utils/testdata/tueba-dz/models/mini/params/epoch-{}",
+                "parameters/epoch-{}",
                 epoch
             ))
             .or_exit(format!("Cannot save model for epoch {}", epoch), 1);
@@ -228,7 +227,7 @@ where
         if epoch - best_epoch == config.train.patience {
             eprintln!(
                 "Lost my patience! Best epoch: {} with accuracy: {:.4}",
-                best_epoch, acc
+                best_epoch, best_acc
             );
             break;
         }
