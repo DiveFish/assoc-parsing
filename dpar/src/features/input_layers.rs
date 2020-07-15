@@ -5,13 +5,17 @@ use std::result;
 
 use enum_map::EnumMap;
 use failure::Error;
-use tensorflow::Tensor;
+use ndarray::Array1;
+use rust2vec::{
+    embeddings::Embeddings as R2VEmbeddings, storage::CowArray1, storage::StorageWrap,
+    vocab::VocabWrap,
+};
 
 use features::addr;
-use features::lookup::LookupResult;
+use features::lookup::BoxedLookup;
 use features::parse_addr::parse_addressed_values;
-use features::{BoxedLookup, Lookup, LookupType};
-use system::ParserState;
+use features::Lookup;
+use system::{AttachmentAddr, ParserState};
 
 /// Multiple addressable parts of the parser state.
 ///
@@ -31,12 +35,43 @@ impl AddressedValues {
     /// Multiple addresses are used to e.g. address the left/rightmost
     /// dependency of a token on the stack or buffer.
     pub fn from_buf_read<R>(mut read: R) -> Result<Self, Error>
-    where
-        R: BufRead,
+        where
+            R: BufRead,
     {
         let mut data = String::new();
         read.read_to_string(&mut data)?;
         Ok(AddressedValues(parse_addressed_values(&data)?))
+    }
+}
+
+pub struct Embeddings {
+    embeddings: R2VEmbeddings<VocabWrap, StorageWrap>,
+    unknown: Array1<f32>,
+}
+
+impl Embeddings {
+    pub fn dims(&self) -> usize {
+        self.embeddings.dims()
+    }
+
+    pub fn embedding(&self, word: &str) -> Option<CowArray1<f32>> {
+        self.embeddings.embedding(word)
+    }
+}
+
+impl From<R2VEmbeddings<VocabWrap, StorageWrap>> for Embeddings {
+    fn from(embeddings: R2VEmbeddings<VocabWrap, StorageWrap>) -> Self {
+        let mut unknown = Array1::zeros(embeddings.dims());
+
+        for (_, embed) in &embeddings {
+            unknown += &embed.as_view();
+        }
+        unknown /= embeddings.len() as f32;
+
+        Embeddings {
+            embeddings,
+            unknown,
+        }
     }
 }
 
@@ -46,10 +81,22 @@ impl AddressedValues {
 /// input layers in neural networks. The input vector is split in
 /// vectors for different layers. In each layer, the feature is encoded
 /// as a 32-bit identifier, which is typically the row of the layer
-/// value in an embedding matrix.
+/// value in an embedding matrix. The second type of layer directly
+/// stores floating point values which can represent, for example,
+/// association measures.
 pub struct InputVector {
     pub lookup_layers: EnumMap<Layer, Vec<i32>>,
-    pub embed_layer: Tensor<f32>,
+    pub non_lookup_layer: Vec<f32>,
+}
+
+impl InputVector {
+    /// Construct a new input vector.
+    pub fn new() -> Self {
+        InputVector {
+            lookup_layers: EnumMap::new(),
+            non_lookup_layer: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Enum, Eq, PartialEq)]
@@ -58,6 +105,7 @@ pub enum Layer {
     Tag,
     DepRel,
     Feature,
+    Char,
 }
 
 impl fmt::Display for Layer {
@@ -67,6 +115,7 @@ impl fmt::Display for Layer {
             Layer::Tag => "tags",
             Layer::DepRel => "deprels",
             Layer::Feature => "features",
+            Layer::Char => "chars",
         };
 
         f.write_str(s)
@@ -75,13 +124,14 @@ impl fmt::Display for Layer {
 
 // I am not sure whether I like the use of Borrow here, but is there another
 // convenient way to convert from both addr::Layer and &addr::Layer?
-impl From<&addr::Layer> for Layer {
+impl<'a> From<&'a addr::Layer> for Layer {
     fn from(layer: &addr::Layer) -> Self {
         match layer {
             &addr::Layer::Token => Layer::Token,
             &addr::Layer::Tag => Layer::Tag,
             &addr::Layer::DepRel => Layer::DepRel,
             &addr::Layer::Feature(_) => Layer::Feature,
+            &addr::Layer::Char(_, _) => Layer::Char,
         }
     }
 }
@@ -98,10 +148,10 @@ impl LayerLookups {
     }
 
     pub fn insert<L>(&mut self, layer: Layer, lookup: L)
-    where
-        L: Into<Box<Lookup>>,
+        where
+            L: Into<Box<Lookup>>,
     {
-        self.0[layer] = BoxedLookup::new(lookup)
+        self.0[layer] = BoxedLookup::new(lookup);
     }
 
     /// Get the lookup for a layer.
@@ -116,6 +166,9 @@ impl LayerLookups {
 pub struct InputVectorizer {
     layer_lookups: LayerLookups,
     input_layer_addrs: AddressedValues,
+    no_lowercase_tags: Vec<String>,
+    focus_embeds: Embeddings,
+    context_embeds: Embeddings,
 }
 
 impl InputVectorizer {
@@ -124,26 +177,20 @@ impl InputVectorizer {
     /// The vectorizer is constructed from the layer lookups and the parser
     /// state addresses from which the feature vector should be used. The layer
     /// lookups are used to find the indices that represent the features.
-    pub fn new(layer_lookups: LayerLookups, input_addrs: AddressedValues) -> Self {
+    pub fn new(
+        layer_lookups: LayerLookups,
+        input_addrs: AddressedValues,
+        no_lowercase_tags: Vec<String>,
+        focus_embeds: Embeddings,
+        context_embeds: Embeddings,
+    ) -> Self {
         InputVectorizer {
-            layer_lookups: layer_lookups,
+            layer_lookups,
             input_layer_addrs: input_addrs,
+            no_lowercase_tags,
+            focus_embeds,
+            context_embeds,
         }
-    }
-
-    pub fn embedding_layer_size(&self) -> usize {
-        let mut size = 0;
-
-        for layer in &self.input_layer_addrs.0 {
-            if let Some(lookup) = self.layer_lookups.0[(&layer.layer).into()].as_ref() {
-                match lookup.lookup_type() {
-                    LookupType::Embedding(dims) => size += dims,
-                    LookupType::Index => (),
-                }
-            }
-        }
-
-        size
     }
 
     pub fn layer_addrs(&self) -> &AddressedValues {
@@ -155,15 +202,15 @@ impl InputVectorizer {
         &self.layer_lookups
     }
 
-    pub fn lookup_layer_sizes(&self) -> EnumMap<Layer, usize> {
+    pub fn layer_sizes(&self) -> EnumMap<Layer, usize> {
         let mut sizes = EnumMap::new();
 
         for layer in &self.input_layer_addrs.0 {
-            if let Some(lookup) = self.layer_lookups.0[(&layer.layer).into()].as_ref() {
-                match lookup.lookup_type() {
-                    LookupType::Embedding(_) => (),
-                    LookupType::Index => sizes[(&layer.layer).into()] += 1,
+            match layer.layer {
+                addr::Layer::Char(prefix_len, suffix_len) => {
+                    sizes[Layer::Char] += prefix_len + suffix_len
                 }
+                ref layer => sizes[layer.into()] += 1,
             }
         }
 
@@ -171,19 +218,30 @@ impl InputVectorizer {
     }
 
     /// Vectorize a parser state.
-    pub fn realize(&self, state: &ParserState) -> InputVector {
-        let mut embed_layer = Tensor::new(&[self.embedding_layer_size() as u64]);
-
+    pub fn realize(&self, state: &ParserState, attachment_addrs: &[AttachmentAddr]) -> InputVector {
         let mut lookup_layers = EnumMap::new();
-        for (layer, &size) in &self.lookup_layer_sizes() {
+
+        for (layer, &size) in &self.layer_sizes() {
             lookup_layers[layer] = vec![0; size];
         }
 
-        self.realize_into(state, &mut embed_layer, &mut lookup_layers);
+        let n_deprel_embeds = &self
+            .layer_lookups
+            .layer_lookup(Layer::DepRel)
+            .unwrap()
+            .len();
+        let mut non_lookup_layer = vec![0f32; n_deprel_embeds * attachment_addrs.len()];
+
+        self.realize_into(
+            state,
+            &mut lookup_layers,
+            &mut non_lookup_layer,
+            attachment_addrs,
+        );
 
         InputVector {
-            embed_layer,
             lookup_layers,
+            non_lookup_layer,
         }
     }
 
@@ -191,43 +249,177 @@ impl InputVectorizer {
     pub fn realize_into<S>(
         &self,
         state: &ParserState,
-        embed_layer: &mut [f32],
+        lookup_slices: &mut EnumMap<Layer, S>,
+        non_lookup_slice: &mut [f32],
+        attachment_addrs: &[AttachmentAddr],
+    ) where
+        S: AsMut<[i32]>,
+    {
+        self.realize_into_lookups(state, lookup_slices);
+        self.realize_into_assoc_strengths(state, non_lookup_slice, attachment_addrs);
+    }
+
+    /// Vectorize a parser state into the given lookup slices.
+    pub fn realize_into_lookups<S>(
+        &self,
+        state: &ParserState,
         lookup_slices: &mut EnumMap<Layer, S>,
     ) where
         S: AsMut<[i32]>,
     {
-        let mut embed_offset = 0;
         let mut layer_offsets: EnumMap<Layer, usize> = EnumMap::new();
 
         for layer in &self.input_layer_addrs.0 {
             let val = layer.get(state);
             let mut offset = &mut layer_offsets[(&layer.layer).into()];
 
-            let layer = &layer.layer;
+            match layer.layer {
+                addr::Layer::Char(prefix_len, suffix_len) => match val {
+                    Some(chars) => {
+                        for ch in chars.as_ref().chars() {
+                            lookup_slices[Layer::Char].as_mut()[*offset] = lookup_char(
+                                self.layer_lookups
+                                    .layer_lookup(Layer::Char)
+                                    .expect("Missing layer lookup for: Char"),
+                                ch,
+                            );
 
-            match lookup_value(
-                self.layer_lookups
-                    .layer_lookup(layer.into())
-                    .expect(&format!("Missing layer lookup for: {:?}", layer)),
-                val,
-            ) {
-                LookupResult::Embedding(embed) => {
-                    embed_layer[embed_offset..embed_offset + embed.len()]
-                        .copy_from_slice(embed.as_slice().expect("Embedding is not contiguous"));
-                    embed_offset += embed.len();
-                }
-                LookupResult::Index(idx) => {
-                    lookup_slices[layer.into()].as_mut()[*offset] = idx as i32;
+                            *offset += 1;
+                        }
+                    }
+                    None => {
+                        let null_char = self
+                            .layer_lookups
+                            .layer_lookup(Layer::Char)
+                            .expect("Missing layer lookup for: Char")
+                            .null() as i32;
+                        for _ in 0..(prefix_len + suffix_len) {
+                            lookup_slices[Layer::Char].as_mut()[*offset] = null_char;
+                            *offset += 1;
+                        }
+                    }
+                },
+                ref layer => {
+                    lookup_slices[layer.into()].as_mut()[*offset] = lookup_value(
+                        self.layer_lookups
+                            .layer_lookup(layer.into())
+                            .expect(&format!("Missing layer lookup for: {:?}", layer)),
+                        val,
+                    );
                     *offset += 1;
                 }
             }
         }
     }
+
+    /// Vectorize a parser state into the given association measure slices.
+    ///
+    /// Add to `non_lookup_slice` the association measure between all parser state addresses
+    /// undergoing attachment. Consider all possible dependency relations.
+    pub fn realize_into_assoc_strengths(
+        &self,
+        state: &ParserState,
+        non_lookup_slice: &mut [f32],
+        attachment_addrs: &[AttachmentAddr],
+    ) {
+        if let Some(deprel_layer) = self.layer_lookups.layer_lookup(Layer::DepRel) {
+            let deprels = deprel_layer.lookup_values();
+
+            for (idx, (addr, deprel)) in
+                iproduct!(attachment_addrs.iter(), deprels.iter()).enumerate()
+                {
+                    let addr_head = addr::AddressedValue {
+                        address: vec![addr.head],
+                        layer: addr::Layer::Token,
+                    };
+                    let addr_dependent = addr::AddressedValue {
+                        address: vec![addr.dependent],
+                        layer: addr::Layer::Token,
+                    };
+                    let addr_head_pos = addr::AddressedValue {
+                        address: vec![addr.head],
+                        layer: addr::Layer::Tag,
+                    };
+                    let addr_dependent_pos = addr::AddressedValue {
+                        address: vec![addr.dependent],
+                        layer: addr::Layer::Tag,
+                    };
+                    let head = addr_head.get(state);
+                    let dependent = addr_dependent.get(state);
+                    let head_pos = addr_head_pos.get(state);
+                    let dependent_pos = addr_dependent_pos.get(state);
+
+                    if let (Some(head), Some(dependent), Some(head_pos), Some(dependent_pos)) =
+                    (head, dependent, head_pos, dependent_pos)
+                        {
+                            let association =
+                                self.assoc_strength(&head, &dependent, &head_pos, &dependent_pos, &deprel);
+                            non_lookup_slice[idx] = association.unwrap_or(0.5f32);
+                        }
+                }
+        }
+    }
+
+    fn assoc_strength(
+        &self,
+        head: &str,
+        dependent: &str,
+        head_pos: &str,
+        dependent_pos: &str,
+        deprel: &str,
+    ) -> Option<f32> {
+        let mut head = head.to_string();
+        let mut dependent = dependent.to_string();
+
+        if !self.no_lowercase_tags.contains(&head_pos.to_string()) {
+            head = head.to_lowercase();
+        }
+        if !self.no_lowercase_tags.contains(&dependent_pos.to_string()) {
+            dependent = dependent.to_lowercase();
+        }
+
+        let focus_embedding = self.focus_embeds.embedding(&head);
+
+        // Dependency embedding with words of the form "Regular/Inverse"+"dependency relation+"word"
+        let mut dependent_deprel =
+            String::with_capacity("Regular_".len() + deprel.len() + 1 + dependent.len());
+        dependent_deprel.push_str("Regular_");
+        dependent_deprel.push_str(deprel);
+        dependent_deprel.push_str("_");
+        dependent_deprel.push_str(&dependent);
+
+        let context_embedding = self.context_embeds.embedding(&dependent_deprel);
+
+        if let (Some(focus_embedding), Some(context_embedding)) =
+        (focus_embedding, context_embedding)
+            {
+                let dp = focus_embedding
+                    .into_owned()
+                    .dot(&context_embedding.into_owned());
+                let sigmoid = 1f32 / (1f32 + (dp * (-1f32)).exp());
+                Some(sigmoid)
+            } else {
+            None
+        }
+    }
 }
 
-fn lookup_value<'a>(lookup: &'a Lookup, feature: Option<Cow<str>>) -> LookupResult<'a> {
+fn lookup_char(lookup: &Lookup, feature: char) -> i32 {
+    if feature == '\0' {
+        return lookup.null() as i32;
+    }
+
+    let feature = feature.to_string();
+    if let Some(idx) = lookup.lookup(&feature) {
+        idx as i32
+    } else {
+        lookup.unknown() as i32
+    }
+}
+
+fn lookup_value(lookup: &Lookup, feature: Option<Cow<str>>) -> i32 {
     match feature {
-        Some(f) => lookup.lookup(f.as_ref()).unwrap_or(lookup.unknown()),
-        None => lookup.null(),
+        Some(f) => lookup.lookup(f.as_ref()).unwrap_or(lookup.unknown()) as i32,
+        None => lookup.null() as i32,
     }
 }

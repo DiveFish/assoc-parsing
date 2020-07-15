@@ -107,7 +107,15 @@ where
     let inputs = config.parser.load_inputs()?;
     let lookups = config.lookups.load_lookups()?;
     let layer_ops = config.lookups.layer_ops();
-    let vectorizer = InputVectorizer::new(lookups, inputs);
+    let no_lowercase_tags = config.parser.no_lowercase_tags.clone();
+    let (focus_embeds, context_embeds) = config.parser.load_dep_embeds()?;
+    let vectorizer = InputVectorizer::new(
+        lookups,
+        inputs,
+        no_lowercase_tags,
+        focus_embeds,
+        context_embeds,
+    );
     let system: S = load_system_generic(config)?;
     let guide = load_model(&config, system, vectorizer, &layer_ops)?;
     let parser = GreedyParser::new(guide);

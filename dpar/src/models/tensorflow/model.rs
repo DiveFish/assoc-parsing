@@ -8,7 +8,7 @@ use tensorflow::{
     Tensor,
 };
 
-use features::{InputVectorizer, Layer};
+use features::{InputVectorizer, Layer, LayerLookups};
 use models::tensorflow::LayerTensors;
 use models::ModelPerformance;
 use system::{ParserState, Transition, TransitionSystem};
@@ -26,9 +26,6 @@ mod opnames {
     pub static IS_TRAINING: &str = "model/is_training";
     pub static LR: &str = "model/lr";
 
-    /// Embedding layer.
-    pub static EMBEDS: &str = "model/embeds";
-
     /// Model output.
     pub static LOGITS: &str = "model/logits";
 
@@ -41,6 +38,9 @@ mod opnames {
 
     /// Training.
     pub static TRAIN: &str = "model/train";
+
+    /// Inputs.
+    pub static NON_LOOKUP_LAYER: &str = "model/assoc_strengths";
 }
 
 /// Layer op in the parsing model
@@ -48,9 +48,21 @@ mod opnames {
 /// The parser can use several information layers, such as tokens, tags, and
 /// dependency relations. Such layers have to be mapped to concrete Tensorflow
 /// graph ops. This data structure is used to define a mapping from one
-/// particular layer to a Tensorflow placeholder graph op, for layers that
-/// are table lookups.
-pub struct LayerOp<T>(pub T);
+/// particular layer to a Tensorflow placeholder graph op.
+pub enum LayerOp<T> {
+    /// Op for layers using pre-trained embeddings
+    ///
+    /// For the use of pre-trained embeddings, we need to ops:
+    ///
+    /// * The placeholder op for the layer vector.
+    /// * The placeholder op for the embedding matrix.
+    Embedding { op: T, embed_op: T },
+
+    /// Op for layers using a lookup table.
+    ///
+    /// The given op is the placeholder op for the layer vector.
+    Table { op: T },
+}
 
 impl<S> LayerOp<S>
 where
@@ -58,11 +70,24 @@ where
 {
     /// Convert a graph op identifier to a graph op.
     fn to_graph_op(&self, graph: &Graph) -> Result<LayerOp<Operation>, Error> {
-        Ok(LayerOp(
-            graph
-                .operation_by_name_required(self.0.as_ref())
-                .map_err(status_to_error)?,
-        ))
+        match self {
+            &LayerOp::Embedding {
+                ref op,
+                ref embed_op,
+            } => Ok(LayerOp::Embedding {
+                op: graph
+                    .operation_by_name_required(op.as_ref())
+                    .map_err(status_to_error)?,
+                embed_op: graph
+                    .operation_by_name_required(embed_op.as_ref())
+                    .map_err(status_to_error)?,
+            }),
+            &LayerOp::Table { ref op } => Ok(LayerOp::Table {
+                op: graph
+                    .operation_by_name_required(op.as_ref())
+                    .map_err(status_to_error)?,
+            }),
+        }
     }
 }
 
@@ -119,14 +144,14 @@ where
     session: Session,
     system: T,
     vectorizer: InputVectorizer,
-    layer_ops: LayerOps<Operation>,
+    lookup_layer_ops: LayerOps<Operation>,
+    non_lookup_layer_op: Operation,
     init_op: Operation,
     restore_op: Operation,
     save_op: Operation,
     save_file_path_op: Operation,
     lr_op: Operation,
     is_training_op: Operation,
-    embeds_op: Operation,
     accuracy_op: Operation,
     logits_op: Operation,
     loss_op: Operation,
@@ -237,7 +262,8 @@ where
             .map_err(status_to_error)?;
         let session = Session::new(&session_opts, &graph).map_err(status_to_error)?;
 
-        let layer_ops = op_names.to_graph_ops(&graph)?;
+        let lookup_layer_ops = op_names.to_graph_ops(&graph)?;
+        let non_lookup_layer_op = Self::add_op(&graph, opnames::NON_LOOKUP_LAYER)?;
 
         let init_op = Self::add_op(&graph, opnames::INIT)?;
         let restore_op = Self::add_op(&graph, opnames::RESTORE)?;
@@ -247,27 +273,24 @@ where
         let is_training_op = Self::add_op(&graph, opnames::IS_TRAINING)?;
         let lr_op = Self::add_op(&graph, opnames::LR)?;
 
-        let embeds_op = Self::add_op(&graph, opnames::EMBEDS)?;
-
         let accuracy_op = Self::add_op(&graph, opnames::ACCURACY)?;
         let logits_op = Self::add_op(&graph, opnames::LOGITS)?;
         let loss_op = Self::add_op(&graph, opnames::LOSS)?;
         let targets_op = Self::add_op(&graph, opnames::TARGETS)?;
 
         let train_op = Self::add_op(&graph, opnames::TRAIN)?;
-
         Ok(TensorflowModel {
             system,
             session,
             vectorizer,
-            layer_ops,
+            lookup_layer_ops,
+            non_lookup_layer_op,
             init_op,
             restore_op,
             save_op,
             save_file_path_op,
             is_training_op,
             lr_op,
-            embeds_op,
             accuracy_op,
             logits_op,
             loss_op,
@@ -284,10 +307,10 @@ where
     pub fn predict(
         &mut self,
         states: &[&ParserState],
-        embeds_tensor: &Tensor<f32>,
-        input_tensors: &LayerTensors<i32>,
+        lookup_input_tensors: &LayerTensors<i32>,
+        non_lookup_input_tensors: &Tensor<f32>,
     ) -> Vec<T::Transition> {
-        let logits = self.logits(embeds_tensor, input_tensors);
+        let logits = self.logits(lookup_input_tensors, non_lookup_input_tensors);
 
         let n_labels = logits.dims()[1] as usize;
 
@@ -348,16 +371,22 @@ where
     /// tensor with shape *[batch_size, n_transitions]*.
     fn logits(
         &mut self,
-        embeds_tensor: &Tensor<f32>,
-        input_tensors: &LayerTensors<i32>,
+        lookup_input_tensors: &LayerTensors<i32>,
+        non_lookup_input_tensors: &Tensor<f32>,
     ) -> Tensor<f32> {
         let mut is_training = Tensor::new(&[]);
         is_training[0] = false;
 
         let mut args = SessionRunArgs::new();
         args.add_feed(&self.is_training_op, 0, &is_training);
-        args.add_feed(&self.embeds_op, 0, embeds_tensor);
-        add_to_args(&mut args, &self.layer_ops, &input_tensors);
+        add_to_args(
+            &mut args,
+            &self.lookup_layer_ops,
+            self.vectorizer.layer_lookups(),
+            &lookup_input_tensors,
+            &self.non_lookup_layer_op,
+            &non_lookup_input_tensors,
+        );
         let logits_token = args.request_fetch(&self.logits_op, 0);
         self.session.run(&mut args).expect("Cannot run graph");
 
@@ -390,8 +419,8 @@ where
     /// The loss and accuracy on the gold standard labels are returned.
     pub fn train(
         &mut self,
-        embeds: &Tensor<f32>,
-        input_tensors: &LayerTensors<i32>,
+        lookup_input_tensors: &LayerTensors<i32>,
+        non_lookup_input_tensors: &Tensor<f32>,
         targets: &Tensor<i32>,
         learning_rate: f32,
     ) -> ModelPerformance {
@@ -406,7 +435,12 @@ where
         args.add_feed(&self.lr_op, 0, &lr);
         args.add_target(&self.train_op);
 
-        self.validate_(args, embeds, input_tensors, targets)
+        self.validate_(
+            args,
+            lookup_input_tensors,
+            non_lookup_input_tensors,
+            targets,
+        )
     }
 
     /// Perform a validation step.
@@ -416,8 +450,8 @@ where
     /// (`input_tensors`).
     pub fn validate(
         &mut self,
-        embeds: &Tensor<f32>,
-        input_tensors: &LayerTensors<i32>,
+        lookup_input_tensors: &LayerTensors<i32>,
+        non_lookup_input_tensors: &Tensor<f32>,
         targets: &Tensor<i32>,
     ) -> ModelPerformance {
         let mut is_training = Tensor::new(&[]);
@@ -425,19 +459,30 @@ where
 
         let mut args = SessionRunArgs::new();
         args.add_feed(&self.is_training_op, 0, &is_training);
-        self.validate_(args, embeds, input_tensors, targets)
+        self.validate_(
+            args,
+            lookup_input_tensors,
+            non_lookup_input_tensors,
+            targets,
+        )
     }
 
     fn validate_<'l>(
         &'l mut self,
         mut args: SessionRunArgs<'l>,
-        embeds: &'l Tensor<f32>,
-        input_tensors: &'l LayerTensors<i32>,
+        lookup_input_tensors: &'l LayerTensors<i32>,
+        non_lookup_input_tensors: &'l Tensor<f32>,
         targets: &'l Tensor<i32>,
     ) -> ModelPerformance {
         // Add inputs.
-        args.add_feed(&self.embeds_op, 0, embeds);
-        add_to_args(&mut args, &self.layer_ops, input_tensors);
+        add_to_args(
+            &mut args,
+            &self.lookup_layer_ops,
+            self.vectorizer.layer_lookups(),
+            lookup_input_tensors,
+            &self.non_lookup_layer_op,
+            non_lookup_input_tensors,
+        );
 
         // Add gold labels.
         args.add_feed(&self.targets_op, 0, targets);
@@ -477,13 +522,39 @@ where
 fn add_to_args<'l>(
     args: &mut SessionRunArgs<'l>,
     layer_ops: &LayerOps<Operation>,
-    input_tensors: &'l LayerTensors<i32>,
+    layer_lookups: &'l LayerLookups,
+    lookup_input_tensors: &'l LayerTensors<i32>,
+    non_lookup_layer_op: &Operation,
+    non_lookup_input_tensors: &'l Tensor<f32>,
 ) {
     for (layer, layer_op) in &layer_ops.0 {
         let layer_op = ok_or!(layer_op.as_ref(), continue);
-        // Fill the layer vector placeholder.
-        args.add_feed(&layer_op.0, 0, &input_tensors[layer]);
+
+        match layer_op {
+            &LayerOp::Embedding {
+                ref op,
+                ref embed_op,
+            } => {
+                // Fill the layer vector placeholder.
+                args.add_feed(op, 0, &lookup_input_tensors[layer]);
+
+                // Fill the embedding placeholder. If we have an op for
+                // the embedding of a layer, there should always be a
+                // corresponding embedding matrix.
+                let embed_matrix = layer_lookups
+                    .layer_lookup(layer)
+                    .unwrap()
+                    .embed_matrix()
+                    .unwrap();
+                args.add_feed(embed_op, 0, embed_matrix);
+            }
+            &LayerOp::Table { ref op } => {
+                // Fill the layer vector placeholder.
+                args.add_feed(op, 0, &lookup_input_tensors[layer]);
+            }
+        }
     }
+    args.add_feed(non_lookup_layer_op, 0, &non_lookup_input_tensors);
 }
 
 /// Tensorflow requires a path that contains a directory component.
@@ -516,8 +587,12 @@ mod tests {
     use std::io::{BufReader, Read};
 
     use flate2::read::GzDecoder;
+    use ndarray::Array2;
+    use rust2vec::embeddings::Embeddings as R2VEmbeddings;
+    use rust2vec::storage::{NdArray, StorageWrap};
+    use rust2vec::vocab::{SimpleVocab, VocabWrap};
 
-    use features::{AddressedValues, InputVectorizer, Layer, LayerLookups};
+    use features::{AddressedValues, Embeddings, InputVectorizer, Layer, LayerLookups};
     use systems::StackProjectiveSystem;
 
     use super::{LayerOp, LayerOps, TensorflowModel};
@@ -532,13 +607,61 @@ mod tests {
             .expect("Cannot decompress test graph.");
 
         let system = StackProjectiveSystem::new();
-        let vectorizer = InputVectorizer::new(LayerLookups::new(), AddressedValues(Vec::new()));
+
+        let focus_matrix =
+            Array2::from_shape_vec((0, 0), Vec::new()).expect("Could not create matrix");
+        let context_matrix =
+            Array2::from_shape_vec((0, 0), Vec::new()).expect("Could not create matrix");
+        let vectorizer = InputVectorizer::new(
+            LayerLookups::new(),
+            AddressedValues(Vec::new()),
+            Vec::new(),
+            Embeddings::from(R2VEmbeddings::new(
+                None,
+                VocabWrap::from(SimpleVocab::new(Vec::new())),
+                StorageWrap::from(NdArray(focus_matrix)),
+            )),
+            Embeddings::from(R2VEmbeddings::new(
+                None,
+                VocabWrap::from(SimpleVocab::new(Vec::new())),
+                StorageWrap::from(NdArray(context_matrix)),
+            )),
+        );
 
         let mut op_names = LayerOps::new();
-        op_names.insert(Layer::Token, LayerOp("model/tokens"));
-        op_names.insert(Layer::Tag, LayerOp("model/tags"));
-        op_names.insert(Layer::DepRel, LayerOp("model/deprels"));
-        op_names.insert(Layer::Feature, LayerOp("model/features"));
+        op_names.insert(
+            Layer::Token,
+            LayerOp::Embedding {
+                op: "model/tokens",
+                embed_op: "model/token_embeds",
+            },
+        );
+        op_names.insert(
+            Layer::Tag,
+            LayerOp::Embedding {
+                op: "model/tags",
+                embed_op: "model/tag_embeds",
+            },
+        );
+        op_names.insert(
+            Layer::DepRel,
+            LayerOp::Table {
+                op: "model/deprels",
+            },
+        );
+        op_names.insert(
+            Layer::Feature,
+            LayerOp::Table {
+                op: "model/features",
+            },
+        );
+        op_names.insert(
+            Layer::Char,
+            LayerOp::Embedding {
+                op: "model/chars",
+                embed_op: "model/char_embeds",
+            },
+        );
 
         TensorflowModel::load_graph(&[], &data, system, vectorizer, &op_names)
             .expect("Cannot load graph.");

@@ -6,7 +6,8 @@ extern crate enum_map;
 #[macro_use]
 extern crate failure;
 
-extern crate finalfusion;
+#[macro_use]
+extern crate itertools;
 
 extern crate ndarray;
 
@@ -19,12 +20,16 @@ extern crate petgraph;
 
 extern crate protobuf;
 
+extern crate rust2vec;
+
 extern crate serde;
 
 #[macro_use]
 extern crate serde_derive;
 
 extern crate tensorflow;
+
+extern crate tf_embed;
 
 extern crate tf_proto;
 

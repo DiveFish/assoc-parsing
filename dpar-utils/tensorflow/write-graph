@@ -63,7 +63,7 @@ if __name__ == '__main__':
         "--keep_prob",
         type=int,
         help="dropout keep probability",
-        default=0.80)
+        default=0.95)
     parser.add_argument(
         "--keep_prob_input",
         type=int,

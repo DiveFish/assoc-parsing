@@ -21,13 +21,16 @@ pub struct TensorCollector<'a, T> {
     transition_system: T,
     vectorizer: &'a InputVectorizer,
     batch_size: usize,
-    embeds: Vec<Tensor<f32>>,
-    inputs: Vec<LayerTensors<i32>>,
+    lookup_inputs: Vec<LayerTensors<i32>>,
     labels: Vec<Tensor<i32>>,
+    non_lookup_inputs: Vec<Tensor<f32>>,
     instance_idx: usize,
 }
 
-impl<'a, T> TensorCollector<'a, T> {
+impl<'a, T> TensorCollector<'a, T>
+    where
+        T: TransitionSystem,
+{
     /// Construct a tensor collector.
     ///
     /// The tensor collector will use the given transition system, parser state
@@ -37,9 +40,9 @@ impl<'a, T> TensorCollector<'a, T> {
             transition_system,
             vectorizer,
             batch_size,
-            embeds: Vec::new(),
-            inputs: Vec::new(),
+            lookup_inputs: Vec::new(),
             labels: Vec::new(),
+            non_lookup_inputs: Vec::new(),
             instance_idx: 0,
         }
     }
@@ -52,14 +55,16 @@ impl<'a, T> TensorCollector<'a, T> {
 
         let last_size = self.instance_idx;
 
-        let old_embeds = self.embeds.pop().expect("No batches");
-        self.embeds.push(old_embeds.copy_batches(last_size as u64));
-
-        let old_inputs = self.inputs.pop().expect("No batches");
-        self.inputs.push(old_inputs.copy_batches(last_size as u64));
+        let old_lookup_inputs = self.lookup_inputs.pop().expect("No batches");
+        self.lookup_inputs
+            .push(old_lookup_inputs.copy_batches(last_size as u64));
 
         let old_labels = self.labels.pop().expect("No batches");
         self.labels.push(old_labels.copy_batches(last_size as u64));
+
+        let old_non_lookup_inputs = self.non_lookup_inputs.pop().expect("No batches");
+        self.non_lookup_inputs
+            .push(old_non_lookup_inputs.copy_batches(last_size as u64));
     }
 
     /// Get the collected tensors.
@@ -68,10 +73,10 @@ impl<'a, T> TensorCollector<'a, T> {
     /// tensors. Each tensor is `batch_size` in its first dimension, except
     /// the last label/layer tensors, which is sized to the number of instances
     /// of the last batch.
-    pub fn into_data(mut self) -> (Vec<Tensor<i32>>, Vec<Tensor<f32>>, Vec<LayerTensors<i32>>) {
+    pub fn into_data(mut self) -> (Vec<Tensor<i32>>, Vec<LayerTensors<i32>>, Vec<Tensor<f32>>) {
         self.resize_last_batch();
 
-        (self.labels, self.embeds, self.inputs)
+        (self.labels, self.lookup_inputs, self.non_lookup_inputs)
     }
 
     /// Get the transition system of the collector.
@@ -79,17 +84,11 @@ impl<'a, T> TensorCollector<'a, T> {
         &self.transition_system
     }
 
-    fn new_embed_tensor(&self, batch_size: usize) -> Tensor<f32> {
-        let embed_size = self.vectorizer.embedding_layer_size();
-
-        Tensor::new(&[batch_size as u64, embed_size as u64])
-    }
-
     /// Construct net layer batch tensors.
     ///
     /// Each tensor has shape `[batch_size, layer_size]`.
     fn new_layer_tensors(&self, batch_size: usize) -> LayerTensors<i32> {
-        let layer_sizes = self.vectorizer.lookup_layer_sizes();
+        let layer_sizes = self.vectorizer.layer_sizes();
 
         let mut layers: EnumMap<Layer, TensorWrap<i32>> = EnumMap::new();
         for (layer, tensor) in &mut layers {
@@ -101,17 +100,27 @@ impl<'a, T> TensorCollector<'a, T> {
 }
 
 impl<'a, T> InstanceCollector<T> for TensorCollector<'a, T>
-where
-    T: TransitionSystem,
+    where
+        T: TransitionSystem,
 {
     fn collect(&mut self, t: &T::Transition, state: &ParserState) -> Result<(), Error> {
         // Lazily add a new batch tensor.
+
+        let n_deprel_embeds = self
+            .vectorizer
+            .layer_lookups()
+            .layer_lookup(Layer::DepRel)
+            .unwrap()
+            .len();
+
         if self.instance_idx == 0 {
-            let embed_tensor = self.new_embed_tensor(self.batch_size);
             let layer_tensors = self.new_layer_tensors(self.batch_size);
-            self.embeds.push(embed_tensor);
-            self.inputs.push(layer_tensors);
+            self.lookup_inputs.push(layer_tensors);
             self.labels.push(Tensor::new(&[self.batch_size as u64]));
+            self.non_lookup_inputs.push(Tensor::new(&[
+                self.batch_size as u64,
+                (n_deprel_embeds * T::ATTACHMENT_ADDRS.len()) as u64,
+            ]));
         }
 
         let batch = self.labels.len() - 1;
@@ -119,13 +128,13 @@ where
         let label = self.transition_system.transitions().lookup(t.clone());
         self.labels[batch][self.instance_idx] = label as i32;
 
-        let embed_size = self.embeds[batch].dims()[1] as usize;
-        let embed_offset = self.instance_idx * embed_size;
-
+        let n_non_lookup_inputs = n_deprel_embeds * T::ATTACHMENT_ADDRS.len();
         self.vectorizer.realize_into(
             state,
-            &mut self.embeds[batch][embed_offset..embed_offset + embed_size],
-            &mut self.inputs[batch].to_instance_slices(self.instance_idx),
+            &mut self.lookup_inputs[batch].to_instance_slices(self.instance_idx),
+            &mut self.non_lookup_inputs[batch][(self.instance_idx * n_non_lookup_inputs)
+                ..(self.instance_idx * n_non_lookup_inputs + n_non_lookup_inputs)],
+            &T::ATTACHMENT_ADDRS,
         );
 
         self.instance_idx += 1;
@@ -140,10 +149,15 @@ where
 #[cfg(test)]
 mod tests {
     use conllx::Token;
+    use ndarray::Array2;
+    use rust2vec::embeddings::Embeddings as R2VEmbeddings;
+    use rust2vec::storage::{NdArray, StorageWrap};
+    use rust2vec::vocab::{SimpleVocab, VocabWrap};
 
     use features::addr::{AddressedValue, Layer, Source};
     use features::{
-        self, AddressedValues, InputVectorizer, LayerLookups, Lookup, MutableLookupTable,
+        self, AddressedValues, Embeddings, InputVectorizer, LayerLookups, Lookup,
+        MutableLookupTable,
     };
     use system::{ParserState, Transition};
     use systems::stack_projective::{StackProjectiveSystem, StackProjectiveTransition};
@@ -155,10 +169,10 @@ mod tests {
     fn collect_zero() {
         let vectorizer = test_vectorizer();
         let collector = test_collector(&vectorizer);
-        let (labels, embeds, inputs) = collector.into_data();
+        let (labels, lookup_inputs, non_lookup_inputs) = collector.into_data();
         assert_eq!(labels.len(), 0);
-        assert_eq!(embeds.len(), 0);
-        assert_eq!(inputs.len(), 0);
+        assert_eq!(lookup_inputs.len(), 0);
+        assert_eq!(non_lookup_inputs.len(), 0);
     }
 
     #[test]
@@ -175,20 +189,29 @@ mod tests {
         collector
             .collect(&StackProjectiveTransition::LeftArc("FOO".into()), &state)
             .unwrap();
-        let (labels, embeds, inputs) = collector.into_data();
+        let (labels, lookup_inputs, non_lookup_inputs) = collector.into_data();
 
         // There should be one batch.
         assert_eq!(labels.len(), 1);
-        assert_eq!(embeds.len(), 1);
-        assert_eq!(inputs.len(), 1);
+        assert_eq!(lookup_inputs.len(), 1);
+        assert_eq!(non_lookup_inputs.len(), 1);
 
         // Check batch shapes.
         assert_eq!(labels[0].dims(), &[2]);
-        assert_eq!(inputs[0][features::Layer::Token].dims(), &[2, 2]);
+        assert_eq!(lookup_inputs[0][features::Layer::Token].dims(), &[2, 2]);
+        assert_eq!(non_lookup_inputs[0].dims(), &[2, 2]);
+        assert_eq!(lookup_inputs[0][features::Layer::DepRel].dims(), &[2, 0]);
 
         // Check batch contents.
         assert_eq!(&*labels[0], &[1, 2]);
-        assert_eq!(inputs[0][features::Layer::Token].as_ref(), &[1, 2, 2, 3]);
+        assert_eq!(
+            lookup_inputs[0][features::Layer::Token].as_ref(),
+            &[1, 2, 2, 3]
+        );
+        assert_eq!(
+            &*non_lookup_inputs[0],
+            &[0f32, 0f32, 0f32, 0f32]
+        );
     }
 
     #[test]
@@ -213,24 +236,139 @@ mod tests {
         collector
             .collect(&StackProjectiveTransition::LeftArc("FOO".into()), &state)
             .unwrap();
-        let (labels, embeds, inputs) = collector.into_data();
+        let (labels, lookup_inputs, non_lookup_inputs) = collector.into_data();
 
         // There should be two batches.
         assert_eq!(labels.len(), 2);
-        assert_eq!(embeds.len(), 2);
-        assert_eq!(inputs.len(), 2);
+        assert_eq!(lookup_inputs.len(), 2);
+        assert_eq!(non_lookup_inputs.len(), 2);
 
         // Check batch shapes.
         assert_eq!(labels[0].dims(), &[2]);
-        assert_eq!(inputs[0][features::Layer::Token].dims(), &[2, 2]);
+        assert_eq!(lookup_inputs[0][features::Layer::Token].dims(), &[2, 2]);
+        assert_eq!(non_lookup_inputs[0].dims(), &[2, 2]);
         assert_eq!(labels[1].dims(), &[1]);
-        assert_eq!(inputs[1][features::Layer::Token].dims(), &[1, 2]);
+        assert_eq!(lookup_inputs[1][features::Layer::Token].dims(), &[1, 2]);
+        assert_eq!(non_lookup_inputs[1].dims(), &[1, 2]);
 
         // Check batch contents.
         assert_eq!(&*labels[0], &[1, 1]);
-        assert_eq!(inputs[0][features::Layer::Token].as_ref(), &[1, 2, 2, 3]);
+        assert_eq!(
+            lookup_inputs[0][features::Layer::Token].as_ref(),
+            &[1, 2, 2, 3]
+        );
+        assert_eq!(
+            &*non_lookup_inputs[0],
+            &[0f32, 0f32, 0f32, 0f32]
+        );
         assert_eq!(&*labels[1], &[2]);
-        assert_eq!(inputs[1][features::Layer::Token].as_ref(), &[3, 4]);
+        assert_eq!(lookup_inputs[1][features::Layer::Token].as_ref(), &[3, 4]);
+        assert_eq!(&*non_lookup_inputs[1], &[0f32, 0f32]);
+    }
+
+    #[test]
+    fn collect_one_pmi() {
+        let sent = vec![
+            Token::new("een"),
+            Token::new("collector"),
+            Token::new("test"),
+        ];
+        let mut state = ParserState::new(&sent);
+
+        let pmi_vectorizer = test_pmi_vectorizer();
+        let mut collector = test_collector(&pmi_vectorizer);
+        collector
+            .collect(&StackProjectiveTransition::Shift, &state)
+            .unwrap();
+        StackProjectiveTransition::Shift.apply(&mut state);
+        collector
+            .collect(&StackProjectiveTransition::Shift, &state)
+            .unwrap();
+        StackProjectiveTransition::Shift.apply(&mut state);
+        collector
+            .collect(&StackProjectiveTransition::LeftArc("FOO".into()), &state)
+            .unwrap();
+        StackProjectiveTransition::LeftArc("FOO".into()).apply(&mut state);
+        collector
+            .collect(&StackProjectiveTransition::Shift, &state)
+            .unwrap();
+        let (_labels, _lookup_inputs, non_lookup_inputs) = collector.into_data();
+
+        // There should be two batches.
+        assert_eq!(non_lookup_inputs.len(), 2);
+
+        // Check batch shapes.
+        assert_eq!(non_lookup_inputs[0].dims(), &[2, 2]);
+        assert_eq!(non_lookup_inputs[1].dims(), &[2, 2]);
+
+        // Check batch contents.
+        assert_eq!(
+            &*non_lookup_inputs[0],
+            &[0f32, 0f32, 0f32, 0f32]
+        );
+        assert_eq!(
+            &*non_lookup_inputs[1],
+            &[0f32, 0f32, 0.5f32, 0.5f32]
+        );
+    }
+
+    #[test]
+    fn collect_two_pmis() {
+        let sent = vec![
+            Token::new("een"),
+            Token::new("collector"),
+            Token::new("test"),
+        ];
+        let mut state = ParserState::new(&sent);
+
+        let pmi_vectorizer = test_pmi_vectorizer();
+        let mut collector = test_collector(&pmi_vectorizer);
+        collector
+            .collect(&StackProjectiveTransition::Shift, &state)
+            .unwrap();
+        StackProjectiveTransition::Shift.apply(&mut state);
+        collector
+            .collect(&StackProjectiveTransition::Shift, &state)
+            .unwrap();
+        StackProjectiveTransition::Shift.apply(&mut state);
+        collector
+            .collect(&StackProjectiveTransition::LeftArc("FOO".into()), &state)
+            .unwrap();
+        StackProjectiveTransition::LeftArc("FOO".into()).apply(&mut state);
+        collector
+            .collect(&StackProjectiveTransition::Shift, &state)
+            .unwrap();
+        StackProjectiveTransition::Shift.apply(&mut state);
+        collector
+            .collect(&StackProjectiveTransition::LeftArc("BAR".into()), &state)
+            .unwrap();
+        StackProjectiveTransition::LeftArc("BAR".into()).apply(&mut state);
+        collector
+            .collect(&StackProjectiveTransition::Shift, &state)
+            .unwrap();
+        let (_labels, _lookup_inputs, non_lookup_inputs) = collector.into_data();
+
+        // There should be two batches.
+        assert_eq!(non_lookup_inputs.len(), 3);
+
+        // Check batch shapes.
+        assert_eq!(non_lookup_inputs[0].dims(), &[2, 2]);
+        assert_eq!(non_lookup_inputs[1].dims(), &[2, 2]);
+        assert_eq!(non_lookup_inputs[2].dims(), &[2, 4]);
+
+        // Check batch contents.
+        assert_eq!(
+            &*non_lookup_inputs[0],
+            &[0f32, 0f32, 0f32, 0f32]
+        );
+        assert_eq!(
+            &*non_lookup_inputs[1],
+            &[0f32, 0f32, 0.5f32, 0.5f32]
+        );
+        assert_eq!(
+            &*non_lookup_inputs[2],
+            &[1f32, 0.5f32, 0f32, 0f32, 0.5f32, 0.5f32, 0.5f32, 0.5f32]
+        );
     }
 
     fn test_vectorizer() -> InputVectorizer {
@@ -245,9 +383,91 @@ mod tests {
         };
 
         let mut lookups = LayerLookups::new();
-        let table: Box<Lookup> = Box::new(MutableLookupTable::new());
-        lookups.insert(features::Layer::Token, table);
-        InputVectorizer::new(lookups, AddressedValues(vec![stack0, buffer0]))
+        let token_table: Box<Lookup> = Box::new(MutableLookupTable::new());
+        lookups.insert(features::Layer::Token, token_table);
+        let deprel_table: Box<Lookup> = Box::new(MutableLookupTable::new());
+        lookups.insert(features::Layer::DepRel, deprel_table);
+
+        let no_lowercase_tags = vec!["ROOT".to_string(), "NN".to_string(), "NE".to_string()];
+
+        let focus_matrix =
+            Array2::from_shape_vec((0, 0), Vec::new()).expect("Could not create matrix");
+        let context_matrix =
+            Array2::from_shape_vec((0, 0), Vec::new()).expect("Could not create matrix");
+        let focus_embeds = R2VEmbeddings::new(
+            None,
+            VocabWrap::from(SimpleVocab::new(Vec::new())),
+            StorageWrap::from(NdArray(focus_matrix)),
+        );
+        let context_embeds = R2VEmbeddings::new(
+            None,
+            VocabWrap::from(SimpleVocab::new(Vec::new())),
+            StorageWrap::from(NdArray(context_matrix)),
+        );
+
+        InputVectorizer::new(
+            lookups,
+            AddressedValues(vec![stack0, buffer0]),
+            no_lowercase_tags,
+            Embeddings::from(focus_embeds),
+            Embeddings::from(context_embeds),
+        )
+    }
+
+    fn test_pmi_vectorizer() -> InputVectorizer {
+        let stack0 = AddressedValue {
+            address: vec![Source::Stack(0)],
+            layer: Layer::Token,
+        };
+
+        let stack1 = AddressedValue {
+            address: vec![Source::Stack(1)],
+            layer: Layer::Token,
+        };
+
+        let stack0_ldep0 = AddressedValue {
+            address: vec![Source::Stack(0), Source::LDep(0)],
+            layer: Layer::DepRel,
+        };
+
+        let stack1_rdep0 = AddressedValue {
+            address: vec![Source::Stack(1), Source::RDep(0)],
+            layer: Layer::DepRel,
+        };
+
+        let mut lookups = LayerLookups::new();
+        let token_table: Box<Lookup> = Box::new(MutableLookupTable::new());
+        lookups.insert(features::Layer::Token, token_table);
+        let deprel_table: Box<Lookup> = Box::new(MutableLookupTable::new());
+        lookups.insert(features::Layer::DepRel, deprel_table);
+
+        let no_lowercase_tags = vec!["ROOT".to_string(), "NN".to_string(), "NE".to_string()];
+
+        let focus_matrix =
+            Array2::from_shape_vec((1, 2), vec![10f32, 10f32]).expect("Could not create matrix");
+        let context_matrix = Array2::from_shape_vec((2, 2), vec![-10f32, -10f32, 10f32, 10f32])
+            .expect("Could not create matrix");
+        let focus_embeds = R2VEmbeddings::new(
+            None,
+            VocabWrap::from(SimpleVocab::new(vec!["test".to_string()])),
+            StorageWrap::from(NdArray(focus_matrix)),
+        );
+        let context_embeds = R2VEmbeddings::new(
+            None,
+            VocabWrap::from(SimpleVocab::new(vec![
+                "Regular_FOO_test".to_string(),
+                "Regular_FOO_collector".to_string(),
+            ])),
+            StorageWrap::from(NdArray(context_matrix)),
+        );
+
+        InputVectorizer::new(
+            lookups,
+            AddressedValues(vec![stack0, stack1, stack0_ldep0, stack1_rdep0]),
+            no_lowercase_tags,
+            Embeddings::from(focus_embeds),
+            Embeddings::from(context_embeds),
+        )
     }
 
     fn test_collector(vectorizer: &InputVectorizer) -> TensorCollector<StackProjectiveSystem> {
