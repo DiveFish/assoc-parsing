@@ -187,7 +187,7 @@ where
             epoch, lr, loss, acc
         );
         model
-            .save(format!("epoch-{}", epoch))
+            .save(format!("parameters/epoch-{}", epoch))
             .or_exit(format!("Cannot save model for epoch {}", epoch), 1);
 
         let (_, acc) = run_epoch(
@@ -213,7 +213,7 @@ where
         if epoch - best_epoch == config.train.patience {
             eprintln!(
                 "Lost my patience! Best epoch: {} with accuracy: {:.4}",
-                best_epoch, acc
+                best_epoch, best_acc
             );
             break;
         }
