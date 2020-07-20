@@ -236,6 +236,8 @@ pub struct Model {
     /// graph ops.
     pub inter_op_parallelism_threads: usize,
 
+    /// Allow the process to use only as much space as it needs.
+    pub allow_growth: bool,
 }
 
 impl Model {
@@ -253,6 +255,9 @@ impl Model {
 
         let mut bytes = Vec::new();
         config_proto.write_to_vec(&mut bytes)?;
+
+        config_proto.gpu_options.set_default();
+        config_proto.gpu_options.as_mut().unwrap().allow_growth = self.allow_growth;
 
         Ok(bytes)
     }
