@@ -20,6 +20,7 @@ lazy_static! {
             parameters: String::from("params"),
             intra_op_parallelism_threads: 2,
             inter_op_parallelism_threads: 2,
+            allow_growth: true,
         },
         train: Train {
             initial_lr: 0.05.into(),
