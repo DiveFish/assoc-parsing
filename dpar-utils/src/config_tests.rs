@@ -19,6 +19,7 @@ lazy_static! {
             parameters: String::from("params"),
             intra_op_parallelism_threads: 4,
             inter_op_parallelism_threads: 6,
+            allow_growth: true,
         },
         lookups: Lookups {
             word: Some(Lookup::Embedding {
