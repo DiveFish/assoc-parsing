@@ -13,6 +13,7 @@ lazy_static! {
             no_lowercase_tags: vec!["TAG".to_string()],
             train_batch_size: 8192,
             parse_batch_size: 8192,
+            allow_growth: true,
         },
         model: Model {
             graph: String::from("parser.graph"),
